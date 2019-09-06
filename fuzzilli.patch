@@ -1,0 +1,339 @@
+diff -burN ./cov.c ../quickjs-2019-09-01-fuzzilli/cov.c
+--- ./cov.c	1969-12-31 19:00:00.000000000 -0500
++++ ../quickjs-2019-09-01-fuzzilli/cov.c	2019-09-05 20:32:18.593917239 -0400
+@@ -0,0 +1,61 @@
++#include <inttypes.h>
++#include <fcntl.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/wait.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#define SHM_SIZE 0x100000
++#define MAX_EDGES ((SHM_SIZE - 4) * 8)
++
++struct shmem_data {
++    uint32_t num_edges;
++    unsigned char edges[];
++};
++
++struct shmem_data* shmem;
++
++uint32_t *__edges_start, *__edges_stop;
++void __sanitizer_cov_reset_edgeguards() {
++    uint32_t N = 0;
++    for (uint32_t *x = __edges_start; x < __edges_stop && N < MAX_EDGES; x++)
++        *x = ++N;
++}
++
++void __sanitizer_cov_trace_pc_guard_init(uint32_t* start, uint32_t* stop) {
++    // Map the shared memory region
++    const char* shm_key = getenv("SHM_ID");
++    if (!shm_key) {
++        puts("[COV] no shared memory bitmap available, skipping");
++        shmem = (struct shmem_data*) malloc(SHM_SIZE);
++    } else {
++        int fd = shm_open(shm_key, O_RDWR, S_IREAD | S_IWRITE);
++        if (fd <= -1) {
++            fprintf(stderr, "[COV] Failed to open shared memory region\n");
++            _exit(-1);
++        }
++
++        shmem = (struct shmem_data*) mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        if (shmem == MAP_FAILED) {
++            fprintf(stderr, "[COV] Failed to mmap shared memory region\n");
++            _exit(-1);
++        }
++    }
++
++    __edges_start = start;
++    __edges_stop = stop;
++    __sanitizer_cov_reset_edgeguards();
++
++    shmem->num_edges = (uint32_t)(stop - start);
++    printf("[COV] edge counters initialized. Shared memory: %s with %u edges\n", shm_key, shmem->num_edges);
++}
++
++void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
++  if (!*guard) return;
++  uint32_t index = *guard - 1;
++  shmem->edges[index / 8] |= 1 << (index % 8);
++  *guard = 0;                 // if multiple threads are active, this can lead to crashes due to race conditions
++}
+diff -burN ./cov.h ../quickjs-2019-09-01-fuzzilli/cov.h
+--- ./cov.h	1969-12-31 19:00:00.000000000 -0500
++++ ../quickjs-2019-09-01-fuzzilli/cov.h	2019-09-05 20:32:18.593917239 -0400
+@@ -0,0 +1,11 @@
++#ifndef QUICKJS_COV_H_
++#define QUICKJS_COV_H_
++
++#define REPRL_CRFD 100
++#define REPRL_CWFD 101
++#define REPRL_DRFD 102
++#define REPRL_DWFD 103
++
++void __sanitizer_cov_reset_edgeguards();
++
++#endif /* QUICKJS_COV_H_ */
+diff -burN ./Makefile ../quickjs-2019-09-01-fuzzilli/Makefile
+--- ./Makefile	2019-09-01 11:12:03.000000000 -0400
++++ ../quickjs-2019-09-01-fuzzilli/Makefile	2019-09-05 20:39:05.793217721 -0400
+@@ -28,7 +28,7 @@
+ # Windows cross compilation from Linux
+ #CONFIG_WIN32=y
+ # use link time optimization (smaller and faster executables but slower build)
+-CONFIG_LTO=y
++# CONFIG_LTO=y
+ # consider warnings as errors (for development)
+ #CONFIG_WERROR=y
+ 
+@@ -48,7 +48,9 @@
+ # use the gprof profiler
+ #CONFIG_PROFILE=y
+ # use address sanitizer
+-#CONFIG_ASAN=y
++CONFIG_ASAN=y
++CONFIG_CLANG=y
++CONFIG_M32=
+ 
+ OBJDIR=.obj
+ 
+@@ -60,7 +62,7 @@
+   EXE=
+ endif
+ ifdef CONFIG_CLANG
+-  CC=$(CROSS_PREFIX)clang
++  CC=$(CROSS_PREFIX)clang-6.0
+   CFLAGS=-g -Wall -MMD -MF $(OBJDIR)/$(@F).d
+   CFLAGS += -Wextra
+   CFLAGS += -Wno-sign-compare
+@@ -94,6 +96,7 @@
+ endif
+ DEFINES:=-D_GNU_SOURCE -DCONFIG_VERSION=\"$(shell cat VERSION)\"
+ CFLAGS+=$(DEFINES)
++CFLAGS+=-fsanitize-coverage=trace-pc-guard
+ CFLAGS_DEBUG=$(CFLAGS) -O0
+ CFLAGS_SMALL=$(CFLAGS) -Os
+ CFLAGS_OPT=$(CFLAGS) -O2
+@@ -140,7 +143,7 @@
+ 
+ all: $(OBJDIR) $(OBJDIR)/quickjs.check.o $(OBJDIR)/qjs.check.o $(PROGS)
+ 
+-QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o
++QJS_LIB_OBJS=$(OBJDIR)/quickjs.o $(OBJDIR)/libregexp.o $(OBJDIR)/libunicode.o $(OBJDIR)/cutils.o $(OBJDIR)/quickjs-libc.o $(OBJDIR)/cov.o
+ 
+ QJSBN_LIB_OBJS=$(patsubst %.o, %.bn.o, $(QJS_LIB_OBJS)) $(OBJDIR)/libbf.bn.o
+ 
+@@ -148,7 +151,7 @@
+ 
+ QJSBN_OBJS=$(OBJDIR)/qjs.bn.o $(OBJDIR)/repl-bn.bn.o $(OBJDIR)/qjscalc.bn.o $(QJSBN_LIB_OBJS)
+ 
+-LIBS=-lm
++LIBS=-lm -lrt
+ ifndef CONFIG_WIN32
+ LIBS+=-ldl
+ endif
+diff -burN ./qjs.c ../quickjs-2019-09-01-fuzzilli/qjs.c
+--- ./qjs.c	2019-09-01 11:12:03.000000000 -0400
++++ ../quickjs-2019-09-01-fuzzilli/qjs.c	2019-09-05 20:37:14.255170629 -0400
+@@ -32,6 +32,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <time.h>
++#include <stdbool.h>
+ #if defined(__APPLE__)
+ #include <malloc/malloc.h>
+ #elif defined(__linux__)
+@@ -40,6 +41,7 @@
+ 
+ #include "cutils.h"
+ #include "quickjs-libc.h"
++#include "cov.h"
+ 
+ extern const uint8_t repl[];
+ extern const uint32_t repl_size;
+@@ -76,13 +78,28 @@
+     return ret;
+ }
+ 
+-static int eval_file(JSContext *ctx, const char *filename, int module)
++static int eval_file(JSContext *ctx, const char *filename, int module, bool reprl_mode)
+ {
+     uint8_t *buf;
+     int ret, eval_flags;
+     size_t buf_len;
+-    
++    if (reprl_mode) {
++      assert(read(REPRL_CRFD, &buf_len, 8) == 8);
++      buf = js_malloc(ctx, buf_len + 1);
++      uint8_t* ptr = buf;
++      size_t remaining = buf_len;
++      while (remaining > 0) {
++        ssize_t rv = read(REPRL_DRFD, ptr, remaining);
++        assert(rv >= 0);
++        remaining -= rv;
++        ptr += rv;
++      }
++      buf[buf_len] = 0;
++      filename = "fuzzcode.js";
++    }
++    else {
+     buf = js_load_file(ctx, &buf_len, filename);
++    }
+     if (!buf) {
+         perror(filename);
+         exit(1);
+@@ -291,6 +308,20 @@
+ #ifdef CONFIG_BIGNUM
+     int load_jscalc;
+ #endif
++    int result = 0;
++
++    // Let parent know we are ready
++    bool reprl_mode = true;
++    char helo[] = "HELO";
++    if (write(REPRL_CWFD, helo, 4) != 4 ||
++        read(REPRL_CRFD, helo, 4) != 4) {
++        reprl_mode = false;
++    }
++
++    if (memcmp(helo, "HELO", 4) != 0) {
++        fprintf(stderr, "Invalid response from parent\n");
++        _exit(-1);
++    }
+ 
+ #ifdef CONFIG_BIGNUM
+     /* load jscalc runtime if invoked as 'qjscalc' */
+@@ -384,6 +415,19 @@
+         }
+     }
+ 
++     do {
++    // Keep original indention here for easier diffing against newer versions.
++    if (reprl_mode) {
++      unsigned action = 0;
++      ssize_t nread = read(REPRL_CRFD, &action, 4);
++      if (nread != 4 || action != 'cexe') {
++        fprintf(stderr, "Unknown action: %u\n", action);
++        _exit(-1);
++      }
++    }
++
++    result = 0;
++
+     if (trace_memory) {
+         js_trace_malloc_init(&trace_data);
+         rt = JS_NewRuntime2(&trace_mf, &trace_data);
+@@ -434,7 +478,7 @@
+         } else {
+             const char *filename;
+             filename = argv[optind];
+-            if (eval_file(ctx, filename, module))
++            if (eval_file(ctx, filename, module, reprl_mode))
+                 goto fail;
+         }
+         if (interactive) {
+@@ -476,10 +520,20 @@
+                best[1] + best[2] + best[3] + best[4],
+                best[1], best[2], best[3], best[4]);
+     }
+-    return 0;
++    result = 0;
++    goto done;
+  fail:
+     js_std_free_handlers(rt);
+     JS_FreeContext(ctx);
+     JS_FreeRuntime(rt);
+-    return 1;
++    result = 1;
++  done:
++    // REPRL: send result to parent and reset edge guards
++    if (reprl_mode) {
++      int status = result << 8;
++      assert(write(REPRL_CWFD, &status, 4) == 4);
++      __sanitizer_cov_reset_edgeguards();
++    }
++  } while(reprl_mode);
++  return result;
+ }
+diff -burN ./quickjs-libc.c ../quickjs-2019-09-01-fuzzilli/quickjs-libc.c
+--- ./quickjs-libc.c	2019-09-01 11:12:03.000000000 -0400
++++ ../quickjs-2019-09-01-fuzzilli/quickjs-libc.c	2019-09-05 20:34:21.796069867 -0400
+@@ -52,12 +52,65 @@
+ #include "cutils.h"
+ #include "list.h"
+ #include "quickjs-libc.h"
++#include "cov.h"
+ 
+ static void js_std_dbuf_init(JSContext *ctx, DynBuf *s)
+ {
+     dbuf_init2(s, JS_GetRuntime(ctx), (DynBufReallocFunc *)js_realloc_rt);
+ }
+ 
++static JSValue js_fuzzilli(JSContext *ctx, JSValueConst this_val,
++    int argc, JSValueConst *argv)
++{
++  if (argc < 2)
++    return JS_EXCEPTION;
++
++  const char *str;
++  str = JS_ToCString(ctx, argv[0]);
++
++  if (!str)
++    return JS_EXCEPTION;
++
++  if (strcmp(str, "FUZZILLI_CRASH") == 0) {
++    int arg;
++    if (JS_ToInt32(ctx, &arg, argv[1]))
++      goto fail;
++    switch (arg) {
++      case 0:
++        *((int*)0x41414141) = 0x1337;
++        break;
++      default:
++        assert(0);
++    }
++  } else if (strcmp(str, "FUZZILLI_PRINT") == 0) {
++    static FILE* fzliout = NULL;
++
++    if (!fzliout)
++      fzliout = fdopen(REPRL_DWFD, "w");
++
++    if (!fzliout) {
++      fprintf(stderr, "Fuzzer output channel not available, printing to stdout instead\n");
++      fzliout = stdout;
++    }
++
++    const char* arg;
++    arg = JS_ToCString(ctx, argv[1]);
++
++    if (arg == NULL) {
++      goto fail;
++    }
++
++    fprintf(fzliout, "%s\n", arg);
++    fflush(fzliout);
++    JS_FreeCString(ctx, arg);
++  }
++
++fail:
++  JS_FreeCString(ctx, str);
++  return JS_UNDEFINED;
++}
++
++
+ /* TODO:
+    - add exec() wrapper
+    - add minimal VT100 emulation for win32
+@@ -2343,6 +2396,8 @@
+ 
+     JS_SetPropertyStr(ctx, global_obj, "print",
+                       JS_NewCFunction(ctx, js_print, "print", 1));
++    JS_SetPropertyStr(ctx, global_obj, "fuzzilli",
++                      JS_NewCFunction(ctx, js_fuzzilli, "fuzzilli", 2));
+     JS_SetPropertyStr(ctx, global_obj, "__loadScript",
+                       JS_NewCFunction(ctx, js_loadScript, "__loadScript", 1));
+     
